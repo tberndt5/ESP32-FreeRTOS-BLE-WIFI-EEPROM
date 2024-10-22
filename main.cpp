@@ -4,7 +4,6 @@
  * BLE and store in flash with EEPROM.
  * 
  * Author: Tyler Berndt
- * Website: https://cyberplain.com
  */
  
 // Libraries
