@@ -1,278 +1,293 @@
-/***********************************************
- * ESP32 RTOS Skeleton with WiFi,BLE, and ESP32
- * Description: Set WiFi Network/Password using
- * BLE and store in flash with EEPROM.
- * 
+/************************************************************************************
+ * ESP32 RTOS Skeleton with WiFi & BLE Provisioning
+ *
+ * Description:
+ * This project provides a robust template for an ESP32 application using FreeRTOS.
+ * It allows a user to set the WiFi network (SSID) and password via a Bluetooth
+ * Low Energy (BLE) connection. The credentials are then saved to the ESP32's
+ * internal flash memory using the EEPROM library for persistent storage. The device
+ * will automatically attempt to connect to the configured WiFi network on startup.
+ *
+ * Core Features:
+ * - FreeRTOS tasks for handling WiFi and BLE concurrently.
+ * - BLE server for provisioning WiFi credentials.
+ * - EEPROM for persistent storage of credentials.
+ * - Automatic WiFi connection management.
+ *
  * Author: Tyler Berndt
- */
- 
-// Libraries
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <EEPROM.h>
-#include <WiFi.h>
+ * Version: 1
+ ************************************************************************************/
 
+// Core Libraries
+#include <WiFi.h>
+#include <EEPROM.h>
+
+// BLE Libraries
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// --- Pinning Tasks to a Core ---
+// Best practice for ESP32 with dual-core architecture is to pin tasks.
 #if CONFIG_FREERTOS_UNICORE
 static const BaseType_t app_cpu = 0;
 #else
 static const BaseType_t app_cpu = 1;
 #endif
 
-// Globals
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define NETWORK_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define PASSWORD_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a9"
-#define EEPROM_SIZE         300
-#define SETTINGS_LENGTH     50
-#define BLESERVERNAME       "YOUR APP"
-bool deviceConnected = false;
-char WIFI_NETWORK[50] = "Enter your network";
-char WIFI_PASSWORD[50] = "Enter your password";
-int WIFI_TIMEOUT_MS = 10000;
+// --- Configuration Constants ---
+// EEPROM
+#define EEPROM_SIZE 128 // Allocate 128 bytes for EEPROM. 64 for SSID, 64 for password.
+#define SSID_ADDR 0     // EEPROM address for SSID
+#define PASS_ADDR 64    // EEPROM address for Password
 
-// Bluetooth Service callbacks
-/********************************************
- * class name: MyServerCallbacks()
- * inherit: BLEServerCallbacks
- * functions: onConnect(), onDisconnect()
- * description: Defines what the BLE server
- * does when connected or disconnected to.
- ********************************************/
-class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer){
-    deviceConnected = true;
-  }
-  void onDisconnect(BLEServer* pServer){
-    deviceConnected = false;
-    pServer->getAdvertising()->start();
-  }
+// BLE
+#define BLE_SERVER_NAME "ESP32 Provisioning"
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define SSID_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Characteristic for Network SSID
+#define PASS_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9" // Characteristic for Network Password
+
+// WiFi
+#define WIFI_TIMEOUT_MS 10000 // 10-second timeout for WiFi connection
+
+// --- Global Variables ---
+// These hold the current WiFi credentials. They are loaded from EEPROM on boot.
+String wifi_ssid;
+String wifi_password;
+bool device_connected = false;
+
+// Forward declarations for tasks
+void keepWiFiAlive(void *parameters);
+void blinkLED(void *parameters);
+
+// --- Helper Functions ---
+
+/**
+ * @brief Reads a string from EEPROM until a null terminator is found.
+ * @param address The starting address in EEPROM to read from.
+ * @return The string read from EEPROM.
+ */
+String readStringFromEEPROM(int address) {
+    char data[EEPROM_SIZE];
+    int len = 0;
+    unsigned char k;
+    k = EEPROM.read(address);
+    while (k != 0 && len < EEPROM_SIZE) {
+        k = EEPROM.read(address + len);
+        data[len] = k;
+        len++;
+    }
+    data[len] = '\0';
+    return String(data);
+}
+
+/**
+ * @brief Writes a string to a specific EEPROM address.
+ * @param address The starting address in EEPROM to write to.
+ * @param str The string to write.
+ */
+void writeStringToEEPROM(int address, const String &str) {
+    for (int i = 0; i < str.length(); i++) {
+        EEPROM.write(address + i, str[i]);
+    }
+    EEPROM.write(address + str.length(), '\0'); // Null-terminate the string
+    EEPROM.commit();
+}
+
+/**
+ * @brief Loads WiFi credentials from EEPROM into global variables.
+ */
+void loadCredentials() {
+    EEPROM.begin(EEPROM_SIZE);
+    wifi_ssid = readStringFromEEPROM(SSID_ADDR);
+    wifi_password = readStringFromEEPROM(PASS_ADDR);
+    Serial.println("[INFO] Loaded credentials from EEPROM.");
+    Serial.print("  SSID: ");
+    Serial.println(wifi_ssid.length() > 0 ? wifi_ssid : "Not Set");
+    Serial.print("  Password: ");
+    Serial.println(wifi_password.length() > 0 ? "********" : "Not Set");
+}
+
+// --- BLE Callback Classes ---
+
+/**
+ * @brief Handles BLE server connection and disconnection events.
+ */
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer *pServer) {
+        device_connected = true;
+        Serial.println("[BLE] Client Connected");
+    }
+
+    void onDisconnect(BLEServer *pServer) {
+        device_connected = false;
+        Serial.println("[BLE] Client Disconnected");
+        // Restart advertising to allow new connections
+        pServer->getAdvertising()->start();
+    }
 };
-// Bluetooth Network Characteristic callbacks
-/********************************************
- * class name: MyNetworkCallbacks()
- * inherit: BLECharacteristicCallbacks
- * functions: onWrite()
- * description: Defines what happens when the
- * network characteristic gets a message.
- ********************************************/
-class MyNetworkCallbacks: public BLECharacteristicCallbacks {
-  /********************************************
-  * name: onWrite()
-  * parameters: *networkCharacteristic
-  * description: When a BLE client sends a
-  * message to the network UUID, the value is
-  * stored in EEPROM.
-  ********************************************/
-  void onWrite(BLECharacteristic *networkCharacteristic){
-    char network[SETTINGS_LENGTH] = {0};
-    std::string rxValue = networkCharacteristic->getValue();
-    for(int i=0;i<rxValue.length();i++){
-      network[i] = rxValue[i];
-      Serial.println(rxValue[i]);
+
+/**
+ * @brief Handles write events for the SSID BLE characteristic.
+ */
+class SSIDCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0) {
+            wifi_ssid = ""; // Clear previous value
+            for (int i = 0; i < value.length(); i++) {
+                wifi_ssid += value[i];
+            }
+            Serial.print("[BLE] New SSID received: ");
+            Serial.println(wifi_ssid);
+            writeStringToEEPROM(SSID_ADDR, wifi_ssid);
+        }
     }
-    for(int i=0;i<SETTINGS_LENGTH;i++){
-      WIFI_NETWORK[i] = network[i];
-      EEPROM.write(i,network[i]);
-      EEPROM.commit();
-    }
-    Serial.print("[BLE] Changed WiFi Netowrk to: ");
-    Serial.print(WIFI_NETWORK);
-    Serial.println("");
-  }
 };
-// Bluetooth Password Characteristic callbacks
-/********************************************
- * class name: MyPasswordCallbacks()
- * inherit: BLECharacteristicCallbacks
- * functions: onWrite()
- * description: Defines what happens when the
- * password characteristic gets a message.
- ********************************************/
-class MyPasswordCallbacks: public BLECharacteristicCallbacks {
-  /********************************************
-  * name: onWrite()
-  * parameters: *passwordCharacteristic
-  * description: When a BLE client sends a
-  * message to the password UUID, the value is
-  * stored in EEPROM.
-  ********************************************/
-  void onWrite(BLECharacteristic *passwordCharacteristic){
-    char password[SETTINGS_LENGTH] = {0};
-    std::string rxValue = passwordCharacteristic->getValue();
-    for(int i=0;i < rxValue.length();i++){
-      password[i] = rxValue[i];
+
+/**
+ * @brief Handles write events for the Password BLE characteristic.
+ */
+class PasswordCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0) {
+            wifi_password = ""; // Clear previous value
+            for (int i = 0; i < value.length(); i++) {
+                wifi_password += value[i];
+            }
+            Serial.println("[BLE] New Password received.");
+            writeStringToEEPROM(PASS_ADDR, wifi_password);
+            Serial.println("[INFO] Credentials updated. Restarting device to apply changes.");
+            delay(1000);
+            ESP.restart(); // Restart to connect with new credentials
+        }
     }
-    for(int i=0;i<SETTINGS_LENGTH;i++){
-      WIFI_PASSWORD[i] = password[i];
-      EEPROM.write(SETTINGS_LENGTH+i,password[i]);
-      EEPROM.commit();
-    }
-    Serial.print("[BLE] Changed WiFi Password to: ");
-    Serial.print(WIFI_PASSWORD);
-    Serial.println("");
-  }
 };
-// RTOS Tasks
-/********************************************
- * name: bleStatus()
- * parameters: none
- * description: Outputs the status on the
- * BLE server.
- ********************************************/
-void bleStatus(void *parameter){
-  while(1){
-    if(deviceConnected == true){
-      Serial.println("[BLE] Connected");
-    }
-    else{
-      Serial.println("[BLE] Disconnected");
-    }
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-  }
-}
-/********************************************
- * name: keepWiFiAlive()
- * parameters: none
- * description: Checks to see if there is
- * a WiFi connection. If there is not then
- * it tries to make one.
- ********************************************/
-void keepWiFiAlive(void *parameters){
-  for(;;){
-    if(WiFi.status() == WL_CONNECTED){
-      Serial.println("[WIFI] Wifi still connected");
-      vTaskDelay(10000 / portTICK_PERIOD_MS);
-      continue;
-    }
-    Serial.println("[WIFI] Wifi Connecting");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_NETWORK,WIFI_PASSWORD);
-    unsigned long startAttemptTime = millis();
-    // Keep looping while we're not connected and haven't reached the timeout
-    while(WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < WIFI_TIMEOUT_MS){}
-    // When we could not make a Wifi connection
-    if(WiFi.status() != WL_CONNECTED){
-      Serial.println("[WIFI] Failed");
-      vTaskDelay(20000 / portTICK_PERIOD_MS);
-      continue;
-    }
-    Serial.println("[WIFI] Connected: " + WiFi.localIP());
-  }
-}
-void myTask(void *parameters){
-  for(;;){
-    Serial.println("SUBSCRIBE FOR MORE TUTORIALS!");
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
-  }
-}
-// Functions
-/********************************************
- * name: getWiFiSettings()
- * parameters: none
- * description: Gets WiFi network settigns
- * from EEPROM and stores them in a global
- * variable.
- ********************************************/
-void getWiFiSettings(){
-  // Iterate through EEPROM to get WiFi settings
-  for(int i=0;i<SETTINGS_LENGTH*2;i++){
-    int myByte = EEPROM.read(i);
-    if(i < SETTINGS_LENGTH){
-      if(myByte == 0){
-        // To terminal character array ~string
-        WIFI_NETWORK[i] = EEPROM.read(i);
-      }
-      else{
-        WIFI_NETWORK[i] = (char)EEPROM.read(i);
-      }
-    }
-    else{
-      if(myByte == 0){
-        // To terminal character array ~string
-        WIFI_PASSWORD[i-(SETTINGS_LENGTH)] = EEPROM.read(i);
-      }
-      else{
-        WIFI_PASSWORD[i-(SETTINGS_LENGTH)] = (char)EEPROM.read(i);
-      }
-    }
-  }
-  Serial.print("[WIFI] Network: ");
-  Serial.print(WIFI_NETWORK);
-  Serial.println("");
-  Serial.print("[WIFI] Password: ");
-  Serial.print(WIFI_PASSWORD);
-  Serial.println("");
-}
 
 void setup() {
-  // Put your setup code here, to run once:
-  Serial.begin(115200);
+    Serial.begin(115200);
+    Serial.println("\n[INFO] Device starting up...");
+    pinMode(LED_BUILTIN, OUTPUT);
 
-  // Initialize EEPROM
-  EEPROM.begin(EEPROM_SIZE);
+    // Load stored WiFi credentials from flash memory
+    loadCredentials();
 
-  // Get WiFi settings from EEPROM
-  getWiFiSettings();
-  
-  // Create the BLE Device
-  BLEDevice::init(BLESERVERNAME);
+    // --- Initialize BLE Server ---
+    BLEDevice::init(BLE_SERVER_NAME);
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+    BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Create the BLE Server
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  BLECharacteristic *networkCharacteristic = pService->createCharacteristic(
-                                         NETWORK_UUID,
-                                         BLECharacteristic::PROPERTY_READ |
-                                         BLECharacteristic::PROPERTY_WRITE
-                                       );
-  BLECharacteristic *passwordCharacteristic = pService->createCharacteristic(
-                                         PASSWORD_UUID,
-                                         BLECharacteristic::PROPERTY_READ |
-                                         BLECharacteristic::PROPERTY_WRITE
-                                       );
-  networkCharacteristic->setCallbacks(new MyNetworkCallbacks());
-  passwordCharacteristic->setCallbacks(new MyPasswordCallbacks());
-  networkCharacteristic->setValue(WIFI_NETWORK);
-  passwordCharacteristic->setValue(WIFI_PASSWORD);
-  pService->start();
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
-  pAdvertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
+    // Create SSID Characteristic
+    BLECharacteristic *pSsidCharacteristic = pService->createCharacteristic(
+        SSID_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+    pSsidCharacteristic->setCallbacks(new SSIDCallbacks());
+    pSsidCharacteristic->setValue(wifi_ssid.c_str()); // Set initial value
 
-  // Task to for BLE
-  xTaskCreatePinnedToCore(
-    bleStatus,    // Function to be called
-    "Bluetooth status", // Name of task
-    1024,         // Stack size. bytes
-    NULL,         // Parameter to pass to function
-    3,            // Task priority
-    NULL,         // Task handle
-    app_cpu);     // Run
-  // Task for WiFi
-  xTaskCreatePinnedToCore(
-    keepWiFiAlive,    // Function to be called
-    "Keep WiFi Alive", // Name of task
-    4024,         // Stack size. bytes
-    NULL,         // Parameter to pass to function
-    2,            // Task priority
-    NULL,         // Task handle
-    app_cpu);     // Run
-  // Personal task
-  xTaskCreatePinnedToCore(
-    myTask,       // Function to be called
-    "My Task",    // Name of task
-    1024,         // Stack size. bytes
-    NULL,         // Parameter to pass to function
-    1,            // Task priority
-    NULL,         // Task handle
-    app_cpu);     // Run
+    // Create Password Characteristic
+    BLECharacteristic *pPassCharacteristic = pService->createCharacteristic(
+        PASS_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE); // Write-only for security
+    pPassCharacteristic->setCallbacks(new PasswordCallbacks());
+
+    pService->start();
+
+    // --- Start BLE Advertising ---
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    BLEDevice::startAdvertising();
+    Serial.println("[BLE] Advertising started. Ready for provisioning.");
+
+    // --- Create and Start RTOS Tasks ---
+    xTaskCreatePinnedToCore(
+        keepWiFiAlive,     // Function to be called
+        "WiFi Manager",    // Name of task
+        4096,              // Stack size (bytes)
+        NULL,              // Parameter to pass
+        1,                 // Task priority
+        NULL,              // Task handle
+        app_cpu            // Core to run on
+    );
+
+    xTaskCreatePinnedToCore(
+        blinkLED,          // Function to be called
+        "LED Blinker",     // Name of task
+        1024,              // Stack size
+        NULL,              // Parameter
+        1,                 // Priority
+        NULL,              // Handle
+        app_cpu            // Core
+    );
+}
+
+// --- FreeRTOS Tasks ---
+
+/**
+ * @brief Task to manage the WiFi connection.
+ * It periodically checks the connection status and attempts to reconnect if necessary.
+ */
+void keepWiFiAlive(void *parameters) {
+    for (;;) {
+        // Only try to connect if SSID is configured
+        if (wifi_ssid.length() > 0) {
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.print("[WIFI] Attempting to connect to SSID: ");
+                Serial.println(wifi_ssid);
+                WiFi.mode(WIFI_STA);
+                WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
+
+                unsigned long startAttemptTime = millis();
+                while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < WIFI_TIMEOUT_MS) {
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
+                }
+
+                if (WiFi.status() != WL_CONNECTED) {
+                    Serial.println("[WIFI] Connection Failed!");
+                    vTaskDelay(20000 / portTICK_PERIOD_MS); // Wait before retrying
+                } else {
+                    Serial.print("[WIFI] Connected! IP Address: ");
+                    Serial.println(WiFi.localIP());
+                }
+            }
+        } else {
+            Serial.println("[WIFI] SSID not configured. Waiting for BLE provisioning.");
+        }
+        // Check status every 30 seconds
+        vTaskDelay(30000 / portTICK_PERIOD_MS);
+    }
+}
+
+/**
+ * @brief Task to blink the onboard LED. The blink pattern indicates the device status.
+ * - Slow blink: Waiting for configuration or disconnected.
+ * - Fast blink: BLE client connected.
+ * - Solid ON: WiFi connected.
+ */
+void blinkLED(void *parameters){
+    for(;;){
+        if (WiFi.status() == WL_CONNECTED) {
+            digitalWrite(LED_BUILTIN, HIGH);
+            vTaskDelay(1000 / portTICK_PERIOD_MS); // Check every second
+        } else if (device_connected) { // BLE connected
+            digitalWrite(LED_BUILTIN, HIGH);
+            vTaskDelay(150 / portTICK_PERIOD_MS);
+            digitalWrite(LED_BUILTIN, LOW);
+            vTaskDelay(150 / portTICK_PERIOD_MS);
+        } else { // Disconnected
+            digitalWrite(LED_BUILTIN, HIGH);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            digitalWrite(LED_BUILTIN, LOW);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
 }
 
 void loop() {
-  // The code never gets here!
+    // The main loop is not used in this FreeRTOS-based application.
+    // All functionality is handled by tasks.
+    vTaskDelete(NULL); // Deletes the loop() task to save resources
 }
